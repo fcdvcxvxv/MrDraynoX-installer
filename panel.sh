@@ -1,198 +1,175 @@
 #!/bin/bash
+clear
+read -p "Enter your domain (e.g., panel.example.com): " DOMAIN
 
-PHP_VERSION="8.3"
 
-GREEN="\e[32m"
-RED="\e[31m"
-YELLOW="\e[33m"
-RESET="\e[0m"
+# --- Dependencies ---
+apt update && apt install -y curl apt-transport-https ca-certificates gnupg unzip git tar sudo lsb-release
 
-ok(){ echo -e "${GREEN}✔ $1${RESET}"; }
-err(){ echo -e "${RED}✖ $1${RESET}"; }
-info(){ echo -e "${YELLOW}➜ $1${RESET}"; }
+# Detect OS
+OS=$(lsb_release -is | tr '[:upper:]' '[:lower:]')
 
-pause(){ read -p "Press Enter to continue..."; }
+if [[ "$OS" == "ubuntu" ]]; then
+    echo "✅ Detected Ubuntu. Adding PPA for PHP..."
+    apt install -y software-properties-common
+    LC_ALL=C.UTF-8 add-apt-repository -y ppa:ondrej/php
+elif [[ "$OS" == "debian" ]]; then
+    echo "✅ Detected Debian. Skipping PPA and adding PHP repo manually..."
+    # Add SURY PHP repo for Debian
+    curl -fsSL https://packages.sury.org/php/apt.gpg | gpg --dearmor -o /usr/share/keyrings/sury-php.gpg
+    echo "deb [signed-by=/usr/share/keyrings/sury-php.gpg] https://packages.sury.org/php/ $(lsb_release -cs) main" | tee /etc/apt/sources.list.d/sury-php.list
+fi
 
-# ================= INSTALL =================
-install_panel() {
+# Add Redis GPG key and repo
+curl -fsSL https://packages.redis.io/gpg | sudo gpg --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg
+echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg] https://packages.redis.io/deb $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/redis.list
 
-read -p "Enter domain (panel.example.com): " DOMAIN
-read -p "Enter email for SSL (example@gmail.com): " EMAIL
-
-info "Installing dependencies..."
-apt update -y
-apt install -y curl nginx mariadb-server redis-server certbot python3-certbot-nginx \
-software-properties-common unzip git tar
-
-add-apt-repository -y ppa:ondrej/php
 apt update
 
-apt install -y php${PHP_VERSION} php${PHP_VERSION}-{cli,fpm,common,mysql,mbstring,xml,zip,curl,gd,bcmath}
+# --- Install PHP + extensions ---
+apt install -y php8.3 php8.3-{cli,fpm,common,mysql,mbstring,bcmath,xml,zip,curl,gd,tokenizer,ctype,simplexml,dom} mariadb-server nginx redis-server
 
-# Composer
-curl -sS https://getcomposer.org/installer | php
-mv composer.phar /usr/local/bin/composer
+# --- Install Composer ---
+curl -sS https://getcomposer.org/installer | sudo php -- --install-dir=/usr/local/bin --filename=composer
 
-# Panel
+# --- Download Pterodactyl Panel ---
 mkdir -p /var/www/pterodactyl
 cd /var/www/pterodactyl
-
 curl -Lo panel.tar.gz https://github.com/pterodactyl/panel/releases/latest/download/panel.tar.gz
 tar -xzvf panel.tar.gz
+chmod -R 755 storage/* bootstrap/cache/
 
+# --- MariaDB Setup ---
+DB_NAME=panel
+DB_USER=pterodactyl
+DB_PASS=yourPassword
+mariadb -e "CREATE USER '${DB_USER}'@'127.0.0.1' IDENTIFIED BY '${DB_PASS}';"
+mariadb -e "CREATE DATABASE ${DB_NAME};"
+mariadb -e "GRANT ALL PRIVILEGES ON ${DB_NAME}.* TO '${DB_USER}'@'127.0.0.1' WITH GRANT OPTION;"
+mariadb -e "FLUSH PRIVILEGES;"
+
+# --- .env Setup ---
+if [ ! -f ".env.example" ]; then
+    curl -Lo .env.example https://raw.githubusercontent.com/pterodactyl/panel/develop/.env.example
+fi
 cp .env.example .env
-
-# DB
-DB_PASS=$(openssl rand -base64 12)
-
-mysql -u root <<EOF
-CREATE DATABASE panel;
-CREATE USER 'pterodactyl'@'127.0.0.1' IDENTIFIED BY '$DB_PASS';
-GRANT ALL PRIVILEGES ON panel.* TO 'pterodactyl'@'127.0.0.1';
-FLUSH PRIVILEGES;
-EOF
-
-sed -i "s|APP_URL=.*|APP_URL=http://${DOMAIN}|g" .env
+sed -i "s|APP_URL=.*|APP_URL=https://${DOMAIN}|g" .env
+sed -i "s|DB_DATABASE=.*|DB_DATABASE=${DB_NAME}|g" .env
+sed -i "s|DB_USERNAME=.*|DB_USERNAME=${DB_USER}|g" .env
 sed -i "s|DB_PASSWORD=.*|DB_PASSWORD=${DB_PASS}|g" .env
+if ! grep -q "^APP_ENVIRONMENT_ONLY=" .env; then
+    echo "APP_ENVIRONMENT_ONLY=false" >> .env
+fi
 
-info "Installing panel..."
-composer install --no-dev --optimize-autoloader
+# --- Install PHP dependencies ---
+echo "✅ Installing PHP dependencies..."
+COMPOSER_ALLOW_SUPERUSER=1 composer install --no-dev --optimize-autoloader
+
+# --- Generate Application Key ---
+echo "✅ Generating application key..."
 php artisan key:generate --force
+
+# --- Run Migrations ---
 php artisan migrate --seed --force
 
-chown -R www-data:www-data /var/www/pterodactyl
+# --- Permissions ---
+chown -R www-data:www-data /var/www/pterodactyl/*
+apt install -y cron
+systemctl enable --now cron
+(crontab -l 2>/dev/null; echo "* * * * * php /var/www/pterodactyl/artisan schedule:run >> /dev/null 2>&1") | crontab -
+# --- Nginx Setup ---
+mkdir -p /etc/certs/panel
+cd /etc/certs/panel
+openssl req -new -newkey rsa:4096 -days 3650 -nodes -x509 \
+-subj "/C=NA/ST=NA/L=NA/O=NA/CN=Generic SSL Certificate" \
+-keyout privkey.pem -out fullchain.pem
 
-# NGINX HTTP FIRST
-cat > /etc/nginx/sites-available/pterodactyl.conf <<EOF
+tee /etc/nginx/sites-available/pterodactyl.conf > /dev/null << EOF
 server {
     listen 80;
+    server_name ${DOMAIN};
+    return 301 https://\$server_name\$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
     server_name ${DOMAIN};
 
     root /var/www/pterodactyl/public;
     index index.php;
 
+    ssl_certificate /etc/certs/panel/fullchain.pem;
+    ssl_certificate_key /etc/certs/panel/privkey.pem;
+
+    client_max_body_size 100m;
+    client_body_timeout 120s;
+    sendfile off;
+
     location / {
         try_files \$uri \$uri/ /index.php?\$query_string;
     }
 
-    location ~ \.php$ {
+    location ~ \.php\$ {
+        fastcgi_split_path_info ^(.+\.php)(/.+)\$;
         fastcgi_pass unix:/run/php/php${PHP_VERSION}-fpm.sock;
-        include fastcgi_params;
+        fastcgi_index index.php;
+        include /etc/nginx/fastcgi_params;
+        fastcgi_param PHP_VALUE "upload_max_filesize=100M \n post_max_size=100M";
         fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+    }
+
+    location ~ /\.ht {
+        deny all;
     }
 }
 EOF
 
-ln -sf /etc/nginx/sites-available/pterodactyl.conf /etc/nginx/sites-enabled/
+ln -s /etc/nginx/sites-available/pterodactyl.conf /etc/nginx/sites-enabled/pterodactyl.conf || true
 nginx -t && systemctl restart nginx
 
-# SSL (REAL AUTO SSL)
-info "Requesting SSL certificate..."
-certbot --nginx -d $DOMAIN --non-interactive --agree-tos -m $EMAIL --redirect
-
-if [ $? -eq 0 ]; then
-    sed -i "s|APP_URL=.*|APP_URL=https://${DOMAIN}|g" .env
-    ok "SSL installed successfully"
-else
-    err "SSL failed (check DNS pointing to your server)"
-fi
-
-# Queue
-cat > /etc/systemd/system/pteroq.service <<EOF
+# --- Queue Worker ---
+tee /etc/systemd/system/pteroq.service > /dev/null << 'EOF'
 [Unit]
-Description=Pterodactyl Queue
+Description=Pterodactyl Queue Worker
 After=redis-server.service
 
 [Service]
 User=www-data
-ExecStart=/usr/bin/php /var/www/pterodactyl/artisan queue:work
+Group=www-data
 Restart=always
+ExecStart=/usr/bin/php /var/www/pterodactyl/artisan queue:work --queue=high,standard,low --sleep=3 --tries=3
+RestartSec=5s
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-systemctl daemon-reexec
-systemctl enable --now pteroq redis-server
-
-ok "Panel Installed!"
-echo "DB Password: $DB_PASS"
-
-pause
-}
-
-# ================= USER =================
-create_user() {
-cd /var/www/pterodactyl || return
-php artisan p:user:make
-pause
-}
-
-# ================= UPDATE =================
-update_panel() {
-cd /var/www/pterodactyl || return
-
-php artisan down
-curl -Lo panel.tar.gz https://github.com/pterodactyl/panel/releases/latest/download/panel.tar.gz
-tar -xzvf panel.tar.gz
-
-composer install --no-dev --optimize-autoloader
-php artisan migrate --seed --force
-php artisan up
-
-ok "Updated!"
-pause
-}
-
-# ================= UNINSTALL =================
-uninstall_panel() {
-
-read -p "Confirm uninstall (y/n): " c
-[[ "$c" != "y" ]] && return
-
-rm -rf /var/www/pterodactyl
-
-mysql -u root -e "DROP DATABASE panel;"
-mysql -u root -e "DROP USER 'pterodactyl'@'127.0.0.1';"
-
-rm -f /etc/nginx/sites-enabled/pterodactyl.conf
-rm -f /etc/nginx/sites-available/pterodactyl.conf
-
-systemctl restart nginx
-
-ok "Removed!"
-pause
-}
-
-# ================= MENU =================
-while true; do
-
+systemctl daemon-reload
+systemctl enable --now redis-server
+systemctl enable --now pteroq.service
 clear
-echo "Pterodactyl Control"
+# --- Admin User ---
+cd /var/www/pterodactyl
+php artisan p:user:make 
 
-if [ -d "/var/www/pterodactyl" ]; then
-echo "Status: INSTALLED"
-else
-echo "Status: NOT INSTALLED"
-fi
+sed -i '/^APP_ENVIRONMENT_ONLY=/d' .env
+echo "APP_ENVIRONMENT_ONLY=false" >> .env
 
-echo ""
-echo "1) Install Panel"
-echo "2) Create User"
-echo "3) Update Panel"
-echo "4) Uninstall Panel"
-echo "5) Exit"
-echo ""
-
-read -p "Select: " ch
-
-case $ch in
-1) install_panel ;;
-2) create_user ;;
-3) update_panel ;;
-4) uninstall_panel ;;
-5) exit ;;
-*) echo "Invalid"; sleep 1 ;;
-esac
-
+# --- Animated Info ---
+echo -e "\n\e[1;32m✔ Pterodactyl Panel Setup Complete!\e[0m"
+echo -ne "\e[1;34mFinalizing installation"
+for i in {1..5}; do
+    echo -n "."
+    sleep 0.5
 done
+echo -e "\n"
+
+echo -e "\e[1;33m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\e[0m"
+echo -e "\e[1;36m  ✅ Installation Completed Successfully! \e[0m"
+echo -e "\e[1;33m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\e[0m"
+echo -e "\e[1;32m  🌐 Your Panel URL: \e[1;37mhttps://${DOMAIN}\e[0m"
+echo -e "\e[1;32m  📂 Panel Directory: \e[1;37m/var/www/pterodactyl\e[0m"
+echo -e "\e[1;32m  🛠 Create Admin: \e[1;37mphp artisan p:user:make\e[0m"
+echo -e "\e[1;32m  🔑 DB User: \e[1;37m${DB_USER}\e[0m"
+echo -e "\e[1;32m  🔑 DB Password: \e[1;37m${DB_PASS}\e[0m"
+echo -e "\e[1;33m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\e[0m"
